@@ -13,6 +13,9 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+.agents/
+.codex/
+.ruff_cache/
 
 # Third-party clones the README creates in the repo root
 Grounded-SAM-2/
@@ -29,6 +32,9 @@ gdino_checkpoints/
 data/
 data_episodes/
 data_episodes_augmented/
+result/
+medium/
+agent_docs/
 
 # Run products: training, validation and rendering outputs
 outputs/

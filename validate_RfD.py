@@ -145,6 +145,7 @@ def _val_rollout_window(
     chunk_dt: float, ground_height: float,
     rollout_steps: int,
     device: torch.device,
+    return_frame_positions: bool = False,
 ):
     """One-window no-grad analog of train_RfD.py's _rollout_and_train (no backprop)."""
     ep = ctx["ep"]
@@ -213,9 +214,16 @@ def _val_rollout_window(
     new_velocities = out["final_velocity"].detach()
     new_F          = out["final_deformation_gradient"].detach()
     new_C          = out["final_C"].detach() if out.get("final_C", None) is not None else None
+    frame_positions = None
+    if return_frame_positions:
+        frame_positions = [
+            pred_pos_all[(i + 1) * rollout_steps - 1].detach()
+            for i in range(n_predicted)
+        ]
     return (
         new_positions, new_velocities, new_F, new_C,
         float(loss.item()), float(chamfer_acc.item()), float(l2_acc.item()),
+        frame_positions,
     )
 
 
@@ -235,7 +243,8 @@ def _run_validation(
     w_l2: float,
     use_gvc: bool = True,
     correction_mode: str = "half",
-) -> Optional[Dict[str, float]]:
+    save_trajectory: bool = False,
+) -> Optional[Dict[str, object]]:
     """Two-phase held-out validation (mirrors old validate_RfD.py's --correction-mode):
 
       * Phase 1 — first-half windows: MfM refreshes material per window; RfD
@@ -256,6 +265,7 @@ def _run_validation(
     )
     val_loss_sum = val_chamfer_sum = val_l2_sum = 0.0
     val_windows = 0
+    trajectories = []
     for ctx in val_episodes:
         ep_loss = ep_chamfer = ep_l2 = 0.0
         ep_windows = 0
@@ -268,6 +278,8 @@ def _run_validation(
         material   = material_guess(ep, cfg, 0, seed=int(cfg.train.get("seed", 0)))
         confidence = _default_material_confidence(material)
         positions  = coords[0:1].to(device)
+        predicted = [positions[0].detach().cpu().clone()] if save_trajectory else None
+        predicted_frames = [0] if save_trajectory else None
         velocities = ep["particle_v"][0:1].to(device)
         F_state    = ep["particle_F"][0:1].to(device)
         C_state    = ep["particle_C"][0:1].to(device) if ep.get("particle_C", None) is not None else None
@@ -307,8 +319,11 @@ def _run_validation(
                         material=material,
                         chunk_dt=chunk_dt, ground_height=ground_height,
                     )
+                    if save_trajectory:
+                        predicted.append(positions[0].detach().cpu().clone())
+                        predicted_frames.append(f_start + i + 1)
             else:
-                positions, velocities, F_state, C_state, _, _, _ = _val_rollout_window(
+                positions, velocities, F_state, C_state, _, _, _, frame_positions = _val_rollout_window(
                     engine=engine, ctx=ctx, f_start=f_start, f_end=f_end,
                     n_predicted=k, outer_steps=total_outer_steps,
                     positions=positions, velocities=velocities,
@@ -317,14 +332,19 @@ def _run_validation(
                     w_chamfer=w_chamfer, w_l2=w_l2,
                     chunk_dt=chunk_dt, ground_height=ground_height,
                     rollout_steps=rollout_steps, device=device,
+                    return_frame_positions=save_trajectory,
                 )
+                if save_trajectory:
+                    for i, frame_pos in enumerate(frame_positions or []):
+                        predicted.append(frame_pos.cpu().clone())
+                        predicted_frames.append(f_start + i + 1)
 
         # Phase 2: material frozen, RfD ON (caller-controlled), loss counted.
         engine.enable_corrector(use_gvc)
         for window_idx in range(mid_window_idx, n_full_windows):
             f_start = window_idx * k
             f_end   = f_start + k
-            positions, velocities, F_state, C_state, l, c, l2 = _val_rollout_window(
+            positions, velocities, F_state, C_state, l, c, l2, frame_positions = _val_rollout_window(
                 engine=engine, ctx=ctx, f_start=f_start, f_end=f_end,
                 n_predicted=k, outer_steps=total_outer_steps,
                 positions=positions, velocities=velocities,
@@ -333,7 +353,12 @@ def _run_validation(
                 w_chamfer=w_chamfer, w_l2=w_l2,
                 chunk_dt=chunk_dt, ground_height=ground_height,
                 rollout_steps=rollout_steps, device=device,
+                return_frame_positions=save_trajectory,
             )
+            if save_trajectory:
+                for i, frame_pos in enumerate(frame_positions or []):
+                    predicted.append(frame_pos.cpu().clone())
+                    predicted_frames.append(f_start + i + 1)
             ep_loss += l; ep_chamfer += c; ep_l2 += l2; ep_windows += 1
         # Trailing partial window (tail_frames) is neither rolled nor scored:
         # metric range is mid_frame+1 .. n_full_windows*k, matching validate_MfM.py.
@@ -346,14 +371,23 @@ def _run_validation(
             val_windows += 1
             print(f"[val] ep {ctx['label']}: chamfer={ep_chamfer / ep_windows:.5f} "
                   f"l2={ep_l2 / ep_windows:.5f} frames={ep_windows * k}", flush=True)
+        if save_trajectory:
+            trajectories.append({
+                "label": ctx["label"],
+                "predicted": torch.stack(predicted, dim=0) if predicted else torch.empty(0),
+                "predicted_frames": torch.tensor(predicted_frames, dtype=torch.long),
+            })
     if val_windows == 0:
         return None
-    return {
+    result = {
         "loss":    val_loss_sum    / val_windows,
         "chamfer": val_chamfer_sum / val_windows,
         "l2":      val_l2_sum      / val_windows,
         "windows": val_windows,
     }
+    if save_trajectory:
+        result["trajectories"] = trajectories
+    return result
 
 
 # --- Build a single val episode context ---
@@ -498,6 +532,7 @@ def validate(args: argparse.Namespace) -> None:
             k=k, rollout_steps=rollout_steps,
             w_chamfer=w_chamfer, w_l2=w_l2,
             use_gvc=use_gvc, correction_mode=args.correction_mode,
+            save_trajectory=bool(args.save_trajectory),
         )
         elapsed = time.perf_counter() - t0
         if v is None:
@@ -523,6 +558,23 @@ def validate(args: argparse.Namespace) -> None:
         print(f"[val] epoch {epoch_num:03d} val loss={v['loss']:.6g} chamfer={v['chamfer']:.6g} "
               f"l2={v['l2']:.6g} windows={v['windows']} episodes={len(val_episodes)} "
               f"val_time={elapsed:.1f}s", flush=True)
+
+        if args.save_trajectory:
+            trajectory_dir = output_dir / "trajectories" / f"epoch_{epoch_num:04d}"
+            trajectory_dir.mkdir(parents=True, exist_ok=True)
+            for trajectory in v.get("trajectories", []):
+                trajectory_path = trajectory_dir / f"{trajectory['label']}_trajectory.pt"
+                torch.save(
+                    {
+                        "predicted": trajectory["predicted"],
+                        "predicted_frames": trajectory["predicted_frames"],
+                        "use_gvc": bool(use_gvc),
+                        "correction_mode": str(args.correction_mode),
+                        "checkpoint_epoch": int(epoch_num),
+                    },
+                    trajectory_path,
+                )
+                print(f"[val] wrote trajectory {trajectory_path}", flush=True)
 
         # Persist incrementally (crash-safe + live plot refresh).
         history.sort(key=lambda r: int(r.get("epoch", 0)))
@@ -577,6 +629,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-render", action="store_true", help="skip val mp4 rendering (val loss only)")
     p.add_argument("--deactivate-gvc", action="store_true",
                    help="pure MPM (no RfD residual) — ablation")
+    p.add_argument("--save-trajectory", action="store_true",
+                   help="save per-episode particle trajectories for each validated checkpoint")
     p.add_argument("--correction-mode", choices=["none", "half"], default="half",
                    help="first-half PID correction: 'half' (default) snaps tracked "
                         "particles to observations through the first half before the "

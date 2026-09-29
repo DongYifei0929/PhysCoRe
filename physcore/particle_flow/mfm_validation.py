@@ -57,6 +57,8 @@ def material_from_final_chunk(
     gate_min: float = 0.0,
     gate_max: float = 1.0,
     end_frame: Optional[int] = None,
+    prior_log_E: Optional[float] = None,
+    prior_nu: Optional[float] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
     """Per-particle material read out after streaming the episode to `end_frame`.
 
@@ -115,6 +117,10 @@ def material_from_final_chunk(
         feature_window.clear()
         state = pred["state"]
         predicted_material = pred["material"].detach()
+        if prior_log_E is not None:
+            predicted_material[..., 0] = float(prior_log_E)
+        if prior_nu is not None:
+            predicted_material[..., 1] = float(prior_nu)
         last_conf = pred.get("material_confidence", last_conf).detach()
         if gate == "none" or not initialized:
             material = predicted_material
@@ -344,6 +350,8 @@ def interleaved_rollout_validation(
     refresh_tail: bool = False,
     correction_mode: str = "none",
     correction_stop_frame: Optional[int] = None,
+    prior_log_E: Optional[float] = None,
+    prior_nu: Optional[float] = None,
 ) -> Dict[str, object]:
     coords, vel, Fm = ep["coords"], ep["particle_v"], ep["particle_F"]
     C = ep.get("particle_C", None)
@@ -422,6 +430,10 @@ def interleaved_rollout_validation(
         feature_window.clear()
         state = pred["state"]
         material = pred["material"].detach()
+        if prior_log_E is not None:
+            material[..., 0] = float(prior_log_E)
+        if prior_nu is not None:
+            material[..., 1] = float(prior_nu)
         # Global (all-particle) mean confidence for the material standing at this
         # window boundary. In pure_tail the last one written is the midpoint value
         # that gets frozen for the scored half.
@@ -507,6 +519,10 @@ def interleaved_rollout_validation(
             feature_window.clear()
             state = pred["state"]
             material = pred["material"].detach()
+            if prior_log_E is not None:
+                material[..., 0] = float(prior_log_E)
+            if prior_nu is not None:
+                material[..., 1] = float(prior_nu)
             logE_means.append(float(material[..., 0].mean().item()))
             for frame in range(w_start + 1, w_end + 1):
                 from_f = frame - 1

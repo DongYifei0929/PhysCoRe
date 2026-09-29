@@ -1,7 +1,12 @@
-# MfM confidence -> dynamic 3DGS video. Owned by render_MfM_confidence_3dgs.py.
-# Needs `validate_MfM.py --save-rollout` on the same checkpoint and episode.
+# Dynamic 3DGS appearance or MfM-confidence video. Owned by
+# render_MfM_confidence_3dgs.py. Both modes need a trajectory from
+# `validate_MfM.py --save-rollout`; only confidence mode needs its checkpoint.
 
 render:
+  # confidence: replace SH colors with the MfM confidence colormap.
+  # appearance: preserve the pretrained SH colors; checkpoint/channels/cmap and
+  #             the other confidence-only settings below are ignored.
+  mode: confidence
   checkpoint: checkpoints/<MfM_checkpoint>.pt # must be the one that produced traj_path
   episode_root: data_episodes/<dataset>/<case_name>/episode_0000
   gs_dir: gaussian_output/<dataset>/<case_name>/<gs_run>
@@ -10,6 +15,10 @@ render:
   name: null
   device: cuda
   mem_fraction: 0.0
+  # auto prefers gsplat (exact camera K + native alpha) and otherwise falls back
+  # to diff_gaussian_rasterization (centered principal point; alpha uses a second pass).
+  rasterizer: auto
+  max_jobs: 1               # gsplat JIT build parallelism; avoids host-memory spikes
 
   overlay_on_rgb: true
   rgb_root: null

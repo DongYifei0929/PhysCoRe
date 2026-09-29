@@ -1,5 +1,8 @@
-"""
-Render the MfM confidence field as a dynamic 3DGS video for one episode.
+"""Render one predicted episode as a dynamic 3DGS video.
+
+``confidence`` mode recolors the Gaussians with the MfM confidence field.
+``appearance`` mode preserves the pretrained Gaussian SH appearance.  Both modes
+warp Gaussian positions and rotations from the saved MPM particle trajectory.
 """
 
 from __future__ import annotations
@@ -8,6 +11,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -266,12 +270,15 @@ def warp_frame(canonical_xyz, canonical_quat, mpm_canon, mpm_t, relations, knn_i
 @torch.no_grad()
 def main():
     p = argparse.ArgumentParser(
-        description="Render the MfM confidence field as a dynamic 3DGS video (and an "
-                    "overlay on the original RGB) for ONE episode. Everything needed "
-                    "comes from the config; the flags below only override it ad hoc.",
+        description="Render a saved MPM trajectory as a dynamic 3DGS video for ONE "
+                    "episode. render.mode=confidence visualizes MfM confidence; "
+                    "render.mode=appearance preserves the pretrained Gaussian colors. "
+                    "Both modes can overlay the render on the original RGB.",
     )
     p.add_argument("--config", default="configs/render_MfM_confidence_3dgs.yaml")
     # Default None → fall back to the config's `render:` block.
+    p.add_argument("--mode", choices=("confidence", "appearance"), default=None,
+                   help="override render.mode")
     p.add_argument("--checkpoint", default=None, help="override render.checkpoint")
     p.add_argument("--episode-root", default=None, help="override render.episode_root")
     p.add_argument("--gs-dir", default=None, help="override render.gs_dir")
@@ -290,17 +297,27 @@ def main():
         user_cfg = OmegaConf.merge(user_cfg, OmegaConf.from_dotlist(overrides))
     r = user_cfg.get("render", {}) or {}
 
+    mode = str(args.mode or r.get("mode", "confidence")).strip().lower()
+    if mode not in {"confidence", "appearance"}:
+        p.error(f"render.mode must be 'confidence' or 'appearance', got {mode!r}")
     checkpoint = args.checkpoint or r.get("checkpoint", None)
     episode_root = args.episode_root or r.get("episode_root", None)
     gs_dir = args.gs_dir or r.get("gs_dir", None)
     traj_path = args.traj_path or r.get("traj_path", None)
     out_dir_arg = args.out_dir or r.get("out_dir", None)
-    for label, value in (("checkpoint", checkpoint), ("episode_root", episode_root),
-                         ("gs_dir", gs_dir), ("traj_path", traj_path), ("out_dir", out_dir_arg)):
+    required = [("episode_root", episode_root), ("gs_dir", gs_dir),
+                ("traj_path", traj_path), ("out_dir", out_dir_arg)]
+    if mode == "confidence":
+        required.insert(0, ("checkpoint", checkpoint))
+    for label, value in required:
         if not value:
             p.error(f"no {label}: set `render.{label}` in the config or pass --{label.replace('_', '-')}")
     device_name = args.device or r.get("device", "cuda")
+    rasterizer = str(r.get("rasterizer", "auto")).strip().lower()
+    if rasterizer not in {"auto", "gsplat", "diff"}:
+        p.error(f"render.rasterizer must be 'auto', 'gsplat', or 'diff', got {rasterizer!r}")
     mem_fraction = float(r.get("mem_fraction", 0.0))
+    max_jobs = max(int(r.get("max_jobs", 1)), 1)
     iteration = int(r.get("iteration", 10000))
     opacity_threshold = float(r.get("opacity_threshold", 0.01))
     knn_k = int(r.get("knn_k", 16))
@@ -325,43 +342,121 @@ def main():
     if mem_fraction > 0 and device.type == "cuda":
         torch.cuda.set_per_process_memory_fraction(mem_fraction, device.index or 0)
 
+    # Conda's CUDA toolkit keeps nvcc and target headers inside the active
+    # environment.  gsplat 1.4 only probes PATH before loading its cached/JIT
+    # backend, so make that standard layout visible within this process.
+    env_prefix = Path(sys.prefix)
+    env_nvcc = env_prefix / "bin" / "nvcc"
+    env_target = env_prefix / "targets" / "x86_64-linux"
+    if env_nvcc.exists():
+        os.environ["PATH"] = f"{env_nvcc.parent}:{os.environ.get('PATH', '')}"
+        os.environ["CUDA_HOME"] = str(env_prefix)
+        if (env_target / "include").is_dir():
+            os.environ["CPATH"] = ":".join(
+                p for p in (str(env_target / "include"), os.environ.get("CPATH", "")) if p
+            )
+        if (env_target / "lib").is_dir():
+            os.environ["LIBRARY_PATH"] = ":".join(
+                p for p in (str(env_target / "lib"), os.environ.get("LIBRARY_PATH", "")) if p
+            )
+    os.environ.setdefault("MAX_JOBS", str(max_jobs))
+    if Path("/usr/bin/gcc").exists():
+        os.environ.setdefault("CC", "/usr/bin/gcc")
+    if Path("/usr/bin/g++").exists():
+        os.environ.setdefault("CXX", "/usr/bin/g++")
+    if device.type == "cuda":
+        major, minor = torch.cuda.get_device_capability(device)
+        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", f"{major}.{minor}")
+
+    # gsplat 1.4's JIT loader can rebuild even when a valid torch-extension
+    # cache already exists. Register that cached module as `gsplat.csrc` first;
+    # only a genuinely missing cache falls through to gsplat's JIT path.
+    if rasterizer in {"auto", "gsplat"}:
+        try:
+            import gsplat
+            if not hasattr(gsplat, "csrc"):
+                from torch.utils.cpp_extension import (
+                    _get_build_directory,
+                    _import_module_from_library,
+                )
+                build_dir = Path(_get_build_directory("gsplat_cuda", verbose=False))
+                if (build_dir / "gsplat_cuda.so").exists():
+                    gsplat.csrc = _import_module_from_library(
+                        "gsplat_cuda", str(build_dir), True,
+                    )
+        except Exception as exc:
+            print(f"[render] cached gsplat preload failed: {exc}", flush=True)
+
     # Vendored gaussian_splatting lives at the repo root.
     from gaussian_splatting.gaussian_renderer import GaussianModel, render
     from gaussian_splatting.dynamic_utils import interpolate_motions, get_topk_indices
     from gaussian_splatting.scene.cameras import Camera
+
+    has_gsplat_backend = False
+    if rasterizer in {"auto", "gsplat"}:
+        try:
+            from gsplat.cuda import _backend as gsplat_backend
+            has_gsplat_backend = gsplat_backend._C is not None
+        except Exception:
+            has_gsplat_backend = False
+    if rasterizer == "gsplat" and not has_gsplat_backend:
+        raise RuntimeError(
+            "render.rasterizer=gsplat requested, but the gsplat CUDA backend is unavailable. "
+            "Install/build gsplat with a compatible CUDA toolkit or use render.rasterizer=diff."
+        )
+    use_gsplat = has_gsplat_backend if rasterizer == "auto" else rasterizer == "gsplat"
+    active_rasterizer = "gsplat" if use_gsplat else "diff_gaussian_rasterization"
+    print(f"[render] rasterizer={active_rasterizer} (requested={rasterizer}, "
+          f"MAX_JOBS={os.environ['MAX_JOBS']})", flush=True)
 
     name = args.name or r.get("name", None) or Path(episode_root).parent.name
     meta = episode_source_metadata(episode_root)
     flip_z = r.get("flip_z", None)
     flip_z = bool(find_key(meta, "flip_z_to_z_up")) if flip_z is None else bool(flip_z)
 
-    # --- 1) MfM + episode -> per-frame confidence aligned to the trajectory ---
-    model, cfg = load_refiner(checkpoint, user_cfg, device)
+    # --- 1) trajectory, plus MfM confidence only when that render mode needs it ---
+    cfg = defaults(user_cfg)
+    model = None
+    if mode == "confidence":
+        model, cfg = load_refiner(checkpoint, user_cfg, device)
     domain_center = cfg.dataset.get("real_world_domain_center", [0.5, 0.5, 0.2])
     pred_world, pred_frames = load_trajectory(traj_path, episode_root, domain_center, flip_z)
     predicted_frames = [int(f) for f in pred_frames]
-    ds = ParticleFlowEpisodeDataset(
-        [str(episode_root)], cache_size=1,
-        real_world_domain_center=domain_center,
-        observation_views=cfg.dataset.get("observation_views", "all"),
-        observation_view_index=int(cfg.dataset.get("observation_view_index", 0)))
-    ep = ert._load_episode_tensors(ds[0], device)
-    confidence, channels, mid = extract_confidence_field(
-        model, ep, cfg, predicted_frames, full_episode=not midpoint_only,
-        seed=int(cfg.train.get("seed", 0)), warmup_frames=warmup_frames)
-    if running_max:
-        # Per-particle high-water mark, so a later dip (occlusion, a dropped track)
-        # never un-accumulates the color. Before normalization, so the printed span
-        # describes what is drawn.
-        confidence = confidence.cummax(dim=0).values
-    print(f"[{name}] flip_z={flip_z} running_max={running_max} warmup_frames={warmup_frames} "
-          f"confidence {tuple(confidence.shape)} "
-          f"channels={channels} range=[{float(confidence.min()):.3f},{float(confidence.max()):.3f}] "
-          f"mid={mid}", flush=True)
+    ep_raw = torch.load(str(Path(episode_root) / "episode_data.pt"),
+                        weights_only=False, map_location="cpu")
+    episode_frame_count = int(ep_raw["particle_coords"].shape[0])
+
+    confidence = None
+    channels = []
+    if mode == "confidence":
+        ds = ParticleFlowEpisodeDataset(
+            [str(episode_root)], cache_size=1,
+            real_world_domain_center=domain_center,
+            observation_views=cfg.dataset.get("observation_views", "all"),
+            observation_view_index=int(cfg.dataset.get("observation_view_index", 0)))
+        ep = ert._load_episode_tensors(ds[0], device)
+        confidence, channels, mid = extract_confidence_field(
+            model, ep, cfg, predicted_frames, full_episode=not midpoint_only,
+            seed=int(cfg.train.get("seed", 0)), warmup_frames=warmup_frames)
+        if running_max:
+            # Per-particle high-water mark, so a later dip (occlusion, a dropped track)
+            # never un-accumulates the color. Before normalization, so the printed span
+            # describes what is drawn.
+            confidence = confidence.cummax(dim=0).values
+        print(f"[{name}] mode={mode} flip_z={flip_z} running_max={running_max} "
+              f"warmup_frames={warmup_frames} confidence {tuple(confidence.shape)} "
+              f"channels={channels} "
+              f"range=[{float(confidence.min()):.3f},{float(confidence.max()):.3f}] "
+              f"mid={mid}", flush=True)
+    else:
+        print(f"[{name}] mode={mode} flip_z={flip_z}; preserving pretrained SH appearance "
+              "(MfM checkpoint and confidence extraction skipped)", flush=True)
 
     # --- 2) gaussians + canonical kNN (warp + confidence interpolation) ---
     mpm = torch.from_numpy(np.ascontiguousarray(pred_world)).to(device=device, dtype=torch.float32)
-    if confidence.shape[0] != mpm.shape[0] or confidence.shape[1] != mpm.shape[1]:
+    if confidence is not None and (
+        confidence.shape[0] != mpm.shape[0] or confidence.shape[1] != mpm.shape[1]
+    ):
         raise RuntimeError(f"confidence {tuple(confidence.shape)} vs trajectory {tuple(mpm.shape)} mismatch "
                            "(episode / trajectory particle count differ)")
     gaussians = load_gaussians(gs_dir, iteration, opacity_threshold, GaussianModel)
@@ -392,8 +487,6 @@ def main():
         if len(real_K) != len(cam_entries):
             real_K = None
     if real_K is None:
-        ep_raw = torch.load(str(Path(episode_root) / "episode_data.pt"),
-                            weights_only=False, map_location="cpu")
         Ks = ep_raw.get("camera_intrinsics")
         if Ks is not None:
             Ks = np.asarray(Ks, dtype=np.float32)
@@ -405,6 +498,10 @@ def main():
     if real_K is None:
         print(f"[{name}] WARNING: no real intrinsics found — rendering with CENTERED "
               "principal point; overlay may be shifted vs the RGB.", flush=True)
+    elif not use_gsplat:
+        print(f"[{name}] WARNING: diff_gaussian_rasterization does not consume the real "
+              "principal point; overlays use a centered projection and may be shifted. "
+              "Use a working gsplat backend for exact K.", flush=True)
     cameras = [camera_from_entry(e, Camera, K_real=(real_K[i] if real_K else None), device=device_name)
                for i, e in enumerate(cam_entries)]
     cam_names = [e["img_name"] for e in cam_entries]
@@ -415,74 +512,90 @@ def main():
         rgb_root = resolve_rgb_root(meta, r.get("rgb_root", None))
         if rgb_root is None or not rgb_root.exists():
             print(f"[{name}] WARNING: overlay_on_rgb set but no RGB root ({rgb_root}) — "
-                  "writing the confidence render only.", flush=True)
+                  f"writing the {mode} render only.", flush=True)
         else:
             n_src = int(meta.get("num_frames", 0) or 0)
-            if n_src and n_src != int(ep["coords"].shape[0]):
+            if n_src and n_src != episode_frame_count:
                 print(f"[{name}] WARNING: source has {n_src} frames but the episode has "
-                      f"{int(ep['coords'].shape[0])} — overlay frame indices may be off.", flush=True)
+                      f"{episode_frame_count} — overlay frame indices may be off.", flush=True)
             for ci in range(len(cameras)):
-                rgb_stacks[ci] = load_rgb_frames(rgb_root, ci, int(ep["coords"].shape[0]))
+                rgb_stacks[ci] = load_rgb_frames(rgb_root, ci, episode_frame_count)
                 if rgb_stacks[ci] is None:
                     print(f"[{name}] WARNING: no complete RGB stack for view {ci} under "
                           f"{rgb_root / 'color' / str(ci)} — that view gets the render only.", flush=True)
             found = sum(s is not None for s in rgb_stacks)
             print(f"[{name}] overlay RGB from {rgb_root} ({found}/{len(cameras)} views)", flush=True)
 
-    # --- color LUT + per-channel normalization ([1.0, pinned or quantile ceiling]) ---
-    want = [str(c).strip() for c in want_channels] if want_channels else channels
-    chan_idx = [channels.index(c) for c in want if c in channels]
-    if not chan_idx:
-        raise ValueError(f"render.channels={want} matches none of {channels}")
-    lut = torch.tensor(matplotlib.colormaps[cmap_name](np.linspace(0, 1, 256))[:, :3], dtype=torch.float32, device=device)
-    conf_dev = confidence.to(device=device, dtype=torch.float32)
-    # `lo` is the decoder's exact floor (confidence = 1 + exp(.)), not a data statistic.
-    # `hi` is this run's norm_q quantile unless render.norm_hi pins it; pin it to compare
-    # runs, since the quantile moves with the checkpoint.
+    # --- confidence-only color LUT + per-channel normalization ---
+    chan_idx = []
+    lut = None
+    conf_dev = None
     norm = {}
-    print(f"[{name}] confidence over all {conf_dev.shape[0]} frames "
-          f"x {conf_dev.shape[1]} particles:", flush=True)
-    for c in chan_idx:
-        flat = conf_dev[..., c].reshape(-1)
-        q = float(torch.quantile(flat, norm_q))
-        lo = 1.0
-        if norm_hi is not None:
-            hi = float(norm_hi)
+    if mode == "confidence":
+        want = [str(c).strip() for c in want_channels] if want_channels else channels
+        chan_idx = [channels.index(c) for c in want if c in channels]
+        if not chan_idx:
+            raise ValueError(f"render.channels={want} matches none of {channels}")
+        lut = torch.tensor(
+            matplotlib.colormaps[cmap_name](np.linspace(0, 1, 256))[:, :3],
+            dtype=torch.float32, device=device,
+        )
+        conf_dev = confidence.to(device=device, dtype=torch.float32)
+        # `lo` is the decoder's exact floor (confidence = 1 + exp(.)), not a
+        # data statistic. Pin `hi` to compare runs; otherwise use a quantile.
+        print(f"[{name}] confidence over all {conf_dev.shape[0]} frames "
+              f"x {conf_dev.shape[1]} particles:", flush=True)
+        for c in chan_idx:
+            flat = conf_dev[..., c].reshape(-1)
+            q = float(torch.quantile(flat, norm_q))
+            lo = 1.0
+            if norm_hi is not None:
+                hi = float(norm_hi)
+                if hi <= lo:
+                    raise ValueError(f"render.norm_hi={hi} must exceed the confidence floor {lo}")
+                source = "pinned"
+            else:
+                hi = q if q > lo else float(flat.max()) + 1e-3
+                source = f"q{norm_q:g}"
             if hi <= lo:
-                raise ValueError(f"render.norm_hi={hi} must exceed the confidence floor {lo}")
-            source = "pinned"
-        else:
-            hi = q if q > lo else float(flat.max()) + 1e-3
-            source = f"q{norm_q:g}"
-        if hi <= lo:
-            raise ValueError(f"degenerate color range for {channels[c]}: [{lo}, {hi}]")
-        norm[c] = (lo, hi)
-        clipped = float((flat > hi).float().mean()) * 100.0
-        print(f"  {channels[c]:<6} min={float(flat.min()):.6g}  max={float(flat.max()):.6g}  "
-              f"q{norm_q:g}={q:.6g}   ->  color [{lo:.6g},{hi:.6g}] ({source}), "
-              f"{clipped:.2f}% saturated", flush=True)
-    print(f"[{name}] cmap={cmap_name} norm={{ {', '.join(f'{channels[c]}:[{norm[c][0]:.6g},{norm[c][1]:.6g}]' for c in chan_idx)} }}", flush=True)
+                raise ValueError(f"degenerate color range for {channels[c]}: [{lo}, {hi}]")
+            norm[c] = (lo, hi)
+            clipped = float((flat > hi).float().mean()) * 100.0
+            print(f"  {channels[c]:<6} min={float(flat.min()):.6g}  max={float(flat.max()):.6g}  "
+                  f"q{norm_q:g}={q:.6g}   ->  color [{lo:.6g},{hi:.6g}] ({source}), "
+                  f"{clipped:.2f}% saturated", flush=True)
+        print(f"[{name}] cmap={cmap_name} norm={{ "
+              f"{', '.join(f'{channels[c]}:[{norm[c][0]:.6g},{norm[c][1]:.6g}]' for c in chan_idx)} "
+              "}", flush=True)
 
     # --- 3) render ---
-    # render.out_dir IS the run dir: videos directly in it, PNGs under
-    # conf_<channel>/<cam index>/<frame>.png, overlays under overlay/ and with an
-    # `_overlay` suffix. `conf_` = the decoder's precision head, not the material.
+    # render.out_dir IS the run dir. Confidence PNGs use conf_<channel>/<cam>/;
+    # appearance PNGs use appearance/<cam>/. Overlays mirror those paths below
+    # overlay/ and add `_overlay` to the corresponding video name.
     out_dir = Path(out_dir_arg); out_dir.mkdir(parents=True, exist_ok=True)
+    variants = (
+        [(c, f"conf_{channels[c]}", c) for c in chan_idx]
+        if mode == "confidence"
+        else [("appearance", "appearance", None)]
+    )
     png_dirs, overlay_png_dirs = {}, {}
-    for c in chan_idx:
+    for key, label, _ in variants:
         for ci in range(len(cameras)):
             if save_pngs:
-                d = out_dir / f"conf_{channels[c]}" / str(ci)
+                d = out_dir / label / str(ci)
                 d.mkdir(parents=True, exist_ok=True)
-                png_dirs[(ci, c)] = d
+                png_dirs[(ci, key)] = d
                 if rgb_stacks[ci] is not None:
-                    od = out_dir / "overlay" / f"conf_{channels[c]}" / str(ci)
+                    od = out_dir / "overlay" / label / str(ci)
                     od.mkdir(parents=True, exist_ok=True)
-                    overlay_png_dirs[(ci, c)] = od
+                    overlay_png_dirs[(ci, key)] = od
     bg = torch.zeros(3, dtype=torch.float32, device=device)
     pipe = type("P", (), dict(debug=False, compute_cov3D_python=False, convert_SHs_python=False, antialiasing=False))()
     cxyz_buf, cquat_buf = gaussians._xyz.detach().clone(), gaussians._rotation.detach().clone()
+    appearance_dc = gaussians._features_dc.detach().clone()
+    appearance_rest = gaussians._features_rest.detach().clone()
     zero_rest = torch.zeros_like(gaussians._features_rest)
+    coverage_color = torch.ones((n_g, 3), dtype=torch.float32, device=device)
 
     def writer(path):
         return imageio.get_writer(str(path), fps=fps, codec="libx264", quality=7, macro_block_size=1)
@@ -490,13 +603,18 @@ def main():
     # video_frames caps the whole render, mp4s and PNGs alike; null renders every frame.
     n_total = len(predicted_frames)
     n_render = n_total if video_frames is None else max(min(int(video_frames), n_total), 1)
-    writers = {(ci, c): writer(out_dir / f"{name}_{cam_names[ci]}_conf_{channels[c]}.mp4")
-               for ci in range(len(cameras)) for c in chan_idx}
-    overlay_writers = {(ci, c): writer(out_dir / f"{name}_{cam_names[ci]}_conf_{channels[c]}_overlay.mp4")
-                       for ci in range(len(cameras)) for c in chan_idx if rgb_stacks[ci] is not None}
+    writers = {
+        (ci, key): writer(out_dir / f"{name}_{cam_names[ci]}_{label}.mp4")
+        for ci in range(len(cameras)) for key, label, _ in variants
+    }
+    overlay_writers = {
+        (ci, key): writer(out_dir / f"{name}_{cam_names[ci]}_{label}_overlay.mp4")
+        for ci in range(len(cameras)) for key, label, _ in variants
+        if rgb_stacks[ci] is not None
+    }
     capped = "" if n_render == n_total else f" (capped from {n_total})"
     print(f"[{name}] rendering {n_render} frames × {len(cameras)} cams × "
-          f"{len(chan_idx)} channels -> {out_dir}{capped}", flush=True)
+          f"{len(variants)} {mode} variant(s) -> {out_dir}{capped}", flush=True)
     try:
         for fi, src_frame in enumerate(predicted_frames[:n_render]):
             if fi == 0:
@@ -506,23 +624,47 @@ def main():
                                            relations, knn_idx, interpolate_motions, chunk=warp_chunk)
                 gaussians._xyz = xyz_t
                 gaussians._rotation = torch.nn.functional.normalize(quat_t, dim=-1)
-            g_conf = (conf_dev[fi][knn_idx] * knn_w.unsqueeze(-1)).sum(dim=1)   # (n_g, C)
-            for c in chan_idx:
-                lo, hi = norm[c]
-                normed = ((g_conf[:, c] - lo) / (hi - lo + 1e-8)).clamp(0, 1)
-                gaussians._features_dc = ((lut[(normed * 255).long().clamp(0, 255)] - 0.5) / SH_C0).unsqueeze(1)
-                gaussians._features_rest = zero_rest
+            g_conf = None
+            if mode == "confidence":
+                g_conf = (conf_dev[fi][knn_idx] * knn_w.unsqueeze(-1)).sum(dim=1)  # (n_g, C)
+            for key, _, channel_idx in variants:
+                if channel_idx is None:
+                    gaussians._features_dc = appearance_dc
+                    gaussians._features_rest = appearance_rest
+                else:
+                    lo, hi = norm[channel_idx]
+                    normed = ((g_conf[:, channel_idx] - lo) / (hi - lo + 1e-8)).clamp(0, 1)
+                    gaussians._features_dc = (
+                        (lut[(normed * 255).long().clamp(0, 255)] - 0.5) / SH_C0
+                    ).unsqueeze(1)
+                    gaussians._features_rest = zero_rest
                 for ci, camera in enumerate(cameras):
-                    # gsplat returns RGBA; channel 3 is the coverage mask for compositing.
-                    rgba = render(camera, gaussians, pipe, bg, use_gsplat=True)["render"].clamp(0, 1).cpu().numpy()
+                    rendered = render(
+                        camera, gaussians, pipe, bg, use_gsplat=use_gsplat,
+                    )["render"].clamp(0, 1)
+                    if rendered.shape[0] >= 4:
+                        rgba_t = rendered[:4]
+                    else:
+                        # The legacy diff rasterizer returns RGB but no coverage.
+                        # Rendering unit color on black reconstructs the same
+                        # accumulated opacity needed for RGB compositing.
+                        if rgb_stacks[ci] is not None:
+                            alpha = render(
+                                camera, gaussians, pipe, bg,
+                                override_color=coverage_color, use_gsplat=False,
+                            )["render"][:1].clamp(0, 1)
+                        else:
+                            alpha = torch.zeros_like(rendered[:1])
+                        rgba_t = torch.cat((rendered[:3], alpha), dim=0)
+                    rgba = rgba_t.cpu().numpy()
                     rgb = np.transpose(rgba[:3], (1, 2, 0))
                     img = (rgb * 255).astype(np.uint8)
                     h, w = img.shape[:2]
                     ch, cw = (h // 2) * 2, (w // 2) * 2   # libx264 needs even dimensions
                     frame = img[:ch, :cw]
-                    writers[(ci, c)].append_data(frame)
+                    writers[(ci, key)].append_data(frame)
                     if save_pngs:
-                        imageio.imwrite(str(png_dirs[(ci, c)] / f"{fi}.png"), frame)
+                        imageio.imwrite(str(png_dirs[(ci, key)] / f"{fi}.png"), frame)
                     if rgb_stacks[ci] is None:
                         continue
                     alpha = (np.clip(rgba[3] * overlay_alpha_gain, 0.0, 1.0))[..., None]
@@ -536,18 +678,19 @@ def main():
                     a = alpha * overlay_front_opacity
                     over = (a * rgb + (1.0 - a) * backdrop)
                     over = (np.clip(over, 0, 1) * 255).astype(np.uint8)[:ch, :cw]
-                    overlay_writers[(ci, c)].append_data(over)
+                    overlay_writers[(ci, key)].append_data(over)
                     if save_pngs:
-                        imageio.imwrite(str(overlay_png_dirs[(ci, c)] / f"{fi}.png"), over)
+                        imageio.imwrite(str(overlay_png_dirs[(ci, key)] / f"{fi}.png"), over)
     finally:
         gaussians._xyz, gaussians._rotation = cxyz_buf, cquat_buf
+        gaussians._features_dc, gaussians._features_rest = appearance_dc, appearance_rest
         for wr in list(writers.values()) + list(overlay_writers.values()):
             wr.close()
     for ci in range(len(cameras)):
-        for c in chan_idx:
+        for _, label, _ in variants:
             suffix = " (+_overlay.mp4)" if rgb_stacks[ci] is not None else ""
             pngs = f" + {n_render} pngs" if save_pngs else ""
-            print(f"  wrote {out_dir}/{name}_{cam_names[ci]}_conf_{channels[c]}.mp4{suffix} "
+            print(f"  wrote {out_dir}/{name}_{cam_names[ci]}_{label}.mp4{suffix} "
                   f"({n_render} frames{pngs})", flush=True)
 
 

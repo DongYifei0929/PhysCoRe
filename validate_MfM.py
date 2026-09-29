@@ -143,6 +143,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gate-temperature", type=float, default=1.0)
     p.add_argument("--gate-min", type=float, default=0.0)
     p.add_argument("--gate-max", type=float, default=1.0)
+    p.add_argument("--prior-log-E", type=float, default=None,
+                   help="force every particle's log_E to this value after each MfM update")
+    p.add_argument("--prior-nu", type=float, default=None,
+                   help="force every particle's nu to this value after each MfM update")
     p.add_argument("--pure-tail", dest="legacy_pure_tail", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--refresh-tail", dest="legacy_refresh_tail", action="store_true", help=argparse.SUPPRESS)
     return p
@@ -169,6 +173,8 @@ def main() -> None:
     args.save_rollout = (
         bool(vcfg.get("save_rollout", True)) if args.save_rollout is None else bool(args.save_rollout)
     )
+    if (args.prior_log_E is None) != (args.prior_nu is None):
+        p.error("--prior-log-E and --prior-nu must be provided together")
 
     validation_mode = resolve_validation_mode(args, vcfg)
     correction_mode = resolve_correction_mode(args, validation_mode)
@@ -176,6 +182,15 @@ def main() -> None:
 
     ckpt = load_checkpoint(args.checkpoint, map_location="cpu")
     cfg = load_cfg(args, ckpt, user_cfg)
+    if args.prior_log_E is not None:
+        log_E_min = float(cfg.model.log_E_min)
+        log_E_max = float(cfg.model.log_E_max)
+        nu_min = float(cfg.model.nu_min)
+        nu_max = float(cfg.model.nu_max)
+        if not log_E_min <= args.prior_log_E <= log_E_max:
+            p.error(f"--prior-log-E must be in [{log_E_min}, {log_E_max}]")
+        if not nu_min <= args.prior_nu <= nu_max:
+            p.error(f"--prior-nu must be in [{nu_min}, {nu_max}]")
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     model = Refiner(cfg.model).to(device)
@@ -241,6 +256,8 @@ def main() -> None:
                     refresh_tail=(validation_mode == "refresh-tail"),
                     correction_mode=correction_mode,
                     correction_stop_frame=args.correction_stop_frame,
+                    prior_log_E=args.prior_log_E,
+                    prior_nu=args.prior_nu,
                 )
                 rollout = row.pop("rollout", None)
                 save_tail_rollout(args, rollout, row, i, controller_radius, plasticity_model)
@@ -278,6 +295,8 @@ def main() -> None:
                 gate_temperature=float(args.gate_temperature),
                 gate_min=float(args.gate_min),
                 gate_max=float(args.gate_max),
+                prior_log_E=args.prior_log_E,
+                prior_nu=args.prior_nu,
             )
             row = validation_rollout_loss(
                 engine,
